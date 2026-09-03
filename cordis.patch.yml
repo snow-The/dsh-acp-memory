@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-acp-memory
+      name: "@snow-the/dsh-acp-memory"
