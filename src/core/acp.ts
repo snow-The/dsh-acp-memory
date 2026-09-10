@@ -11,6 +11,13 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
+/** FTS5 phrase builder: quotes every token so user text (paths like C:\\x, "*", ":", quotes)
+ * can never be parsed as column filters or operators. Falls back to a harmless empty phrase. */
+function ftsPhrase(q: unknown): string {
+  const toks = String(q ?? '').toLowerCase().replace(/["'^*:()\[\]{}]/g, ' ').split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
+  return toks.length ? toks.map((t) => '"' + t + '"').join(' OR ') : '""';
+}
+
 export function acpGraphPath(): string {
   return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'graph', 'graph.db');
 }
@@ -47,7 +54,7 @@ export function acpGraphRecall(query: string, limit = 4): AcpRecallHit[] {
     try {
       const q = String(query ?? '').toLowerCase().trim();
       if (!q) return [];
-      const matchQ = JSON.stringify(q) + '*';
+      const matchQ = ftsPhrase(q);
       const out: AcpRecallHit[] = [];
       // 1) 实体命中 → 带出它所在的最新 checkpoint
       try {
