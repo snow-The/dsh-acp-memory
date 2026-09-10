@@ -361,7 +361,7 @@ export async function apply(ctx: any) {
         if (priorUser === 0) {
           const db = getMem();
           const firstText = String(lastUser?.content?.[0]?.text ?? '');
-          const inj = buildFirstInjection(db, sid, firstText);
+          const inj = await buildFirstInjection(db, sid, firstText);
           if (inj !== null) {
             const rewritten = [...decision.messages];
             rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
@@ -378,7 +378,7 @@ export async function apply(ctx: any) {
       const db = getMem();
       const queryText = String(lastUser?.content?.[0]?.text ?? '');
       if (queryText) {
-        const hit = buildHitInjection(db, sid, queryText, 2);
+        const hit = await buildHitInjection(db, sid, queryText, 2);
         if (hit !== null) {
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({

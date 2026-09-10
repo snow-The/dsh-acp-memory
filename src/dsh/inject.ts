@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import type { MemoryDb, MemoryRow } from '../core/db.js';
 import { recallSearch, topMemories, hotKeywords } from '../core/recall.js';
 import { acpGraphAvailable, acpGraphRecall, acpGraphHotEntities } from '../core/acp.js';
+import { crossAgentAvailable, crossAgentHot, crossAgentHits } from '../core/crossagent.js';
 
 export interface SessionSeen {
   injected: string[];
@@ -88,7 +89,7 @@ export interface Injection {
 }
 
 /** 首轮注入：soul/user 全量 + rules importance≥2 + 导引 + ACP 热实体 + 命中 top-2。 */
-export function buildFirstInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Injection | null {
+export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Promise<Injection | null> {
   const rows = db.raw();
   const seen = readSeen(sid);
   const parts: string[] = ['===== 长期记忆 ====='];
@@ -129,13 +130,21 @@ export function buildFirstInjection(db: MemoryDb, sid: string, queryText: string
     }
   }
 
+  // 跨上下文/跨 agent 共识（关系层派生数据，存在才用）
+  if (await crossAgentAvailable()) {
+    const hot = await crossAgentHot(5);
+    if (hot.length) {
+      parts.push('【跨会话/跨 agent 共识】' + hot.map((h) => h.title + (h.sources > 1 ? '(' + h.sources + ')' : '')).join(', '));
+    }
+  }
+
   parts.push('【记忆导引】如需更多记忆，用 memory_search / acp_recall 查询。');
   writeSeen(sid, seen);
   return { text: parts.join('\n'), injectedIds: seen.injected };
 }
 
 /** 每轮命中注入：top-2 未见过命中 + ACP recall 融合。 */
-export function buildHitInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Injection | null {
+export async function buildHitInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Promise<Injection | null> {
   const rows = db.raw();
   const seen = readSeen(sid);
   const hits = recallSearch(unseen(rows, seen.injected), { query: queryText, limit: hitTopK });
@@ -153,6 +162,12 @@ export function buildHitInjection(db: MemoryDb, sid: string, queryText: string, 
     for (const a of acpHits) {
       parts.push('- [acp] ' + a.summary.slice(0, 120));
     }
+  }
+  // 跨上下文/跨 agent 共识命中：同一主题被多个会话/子代理独立提到时补充
+  const cross = await crossAgentHits(queryText, 2);
+  for (const c of cross) {
+    const who = c.agent_kinds.length > 1 ? c.agent_kinds.join('+') : c.agent_kinds[0] ?? 'main';
+    parts.push('- [cross-agent] ' + c.title + '（' + c.sources + ' 个上下文/' + who + ' 都提到）');
   }
   markInjected(sid, ids);
   return { text: parts.join('\n'), injectedIds: ids };

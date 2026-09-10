@@ -25,6 +25,36 @@ before(async () => {
   cap = await import('../.test-build/dsh/capture.js');
 });
 
+test('the cross-agent bridge is null-safe when the relation layer is absent', async () => {
+  const { crossAgentAvailable, crossAgentHot, crossAgentHits } = await import('../.test-build/core/crossagent.js');
+  process.env.DSH_NOTEMAP_DB = join(tmpdir(), 'definitely-missing-' + Date.now(), 'graph.db');
+  assert.equal(await crossAgentAvailable(), false, 'missing store means unavailable, not a crash');
+  assert.deepEqual(await crossAgentHot(3), []);
+  assert.deepEqual(await crossAgentHits('anything', 3), []);
+});
+
+test('the cross-agent bridge reads consensus nodes and ignores everything else', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'xagent-'));
+  const dbPath = join(dir, 'graph.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const seed = new DatabaseSync(dbPath);
+  seed.exec('CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, title TEXT, content TEXT, meta TEXT, created_at TEXT, updated_at TEXT)');
+  const insert = seed.prepare('INSERT INTO nodes (id, type, title, content, meta, created_at, updated_at) VALUES (?,?,?,?,?,?,?)');
+  insert.run('digest:r32', 'consensus', 'r32', '', JSON.stringify({ sources: 3, agent_kinds: ['main', 'subagent'], mentions: 42, score: 1.5, kind: 'project' }), '', '');
+  insert.run('note:x', 'note', 'r32 notes', '', '{}', '', '');
+  seed.close();
+  process.env.DSH_NOTEMAP_DB = dbPath;
+  const { crossAgentAvailable, crossAgentHot, crossAgentHits } = await import('../.test-build/core/crossagent.js');
+  assert.equal(await crossAgentAvailable(), true);
+  const hot = await crossAgentHot(5);
+  assert.equal(hot.length, 1, 'only consensus nodes count');
+  assert.equal(hot[0].title, 'r32');
+  assert.equal(hot[0].sources, 3);
+  assert.deepEqual(hot[0].agent_kinds, ['main', 'subagent']);
+  const hits = await crossAgentHits('tell me about r32 please', 2);
+  assert.equal(hits.length, 1, 'a query token matches the digest title');
+});
+
 test('sessionEvents() reads the harness Session shape, not a phantom .events', () => {
   // the real Session: methods + a private log, and NO `events` property
   const real = { ownEvents: () => [{ type: 'turn/end' }], log: [{ type: 'x' }] };
