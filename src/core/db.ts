@@ -134,6 +134,10 @@ export function openDb(path?: string): MemoryDb {
       if (Array.isArray((values as Record<string, unknown>).keywords)) {
         (values as Record<string, unknown>).keywords = JSON.stringify(values.keywords);
       }
+      // node:sqlite cannot bind `undefined` - it throws "Provided value cannot be bound
+      // to SQLite parameter N". A caller that omits an optional field (the capture path
+      // has no project) must fall back to the column default, not blow up the write.
+      for (const key of Object.keys(values)) if (values[key] === undefined) delete values[key];
       const names = Object.keys(values).filter((k) => k === 'id' || cols.includes(k));
       const sql = `INSERT INTO ${level} (${names.join(', ')}) VALUES (${names.map(() => '?').join(', ')})`;
       db.prepare(sql).run(...names.map((n) => values[n] as string | number | null));
@@ -159,6 +163,7 @@ export function openDb(path?: string): MemoryDb {
       const vals: unknown[] = [];
       for (const n of names) {
         let v = patch[n as keyof MemoryRow];
+        if (v === undefined) continue;                    // never bind undefined
         if (n === 'keywords' && Array.isArray(v)) v = JSON.stringify(v);
         sets.push(`${n} = ?`);
         vals.push(v);

@@ -84,7 +84,10 @@ export async function captureTurn(
       written++;
     }
     return written;
-  } catch {
+  } catch (err) {
+    // Never silent again: swallowing this made auto-capture write nothing for a week
+    // while every health check looked green.
+    console.warn('[acp-memory] capture failed:', err instanceof Error ? err.message : String(err));
     return 0;
   }
 }

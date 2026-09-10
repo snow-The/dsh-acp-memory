@@ -312,7 +312,7 @@ export async function apply(ctx: any) {
             const db = getMem();
             const written = await captureTurn(db, session?.events ?? [], captureConfig, null);
             if (written > 0) ctx.logger?.info('acp-memory: captured ' + written + ' memory entries');
-          } catch { /* 捕获失败不阻塞 */ }
+          } catch (err) { console.warn('[acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
         })();
       }
     } catch { /* 事件监听不阻塞 */ }
