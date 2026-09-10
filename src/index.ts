@@ -321,7 +321,7 @@ export async function apply(ctx: any) {
           } catch (err) { console.warn('[acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
         })();
       }
-    } catch { /* 事件监听不阻塞 */ }
+    } catch (err) { console.warn('[acp-memory] session/event listener failed:', err instanceof Error ? err.message : String(err)); }
   });
 
   // pre-step：首轮注入 / 每轮命中 / 压缩重注入

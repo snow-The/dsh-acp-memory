@@ -16,6 +16,16 @@ export function acpGraphPath(): string {
 }
 
 /** ACP 图可用性：graph.db 存在 且 checkpoints 非空。 */
+/**
+ * Every fallback below keeps working when the ACP graph is absent (that is by design),
+ * but a fallback that cannot be told apart from "there is simply no data" is how a
+ * week-long silent outage happened elsewhere in this plugin. Report the failure once
+ * per call - it only fires on the error path, so a healthy install stays quiet.
+ */
+function warn(what: string, err: unknown): void {
+  console.warn('[acp-memory] ' + what + ':', err instanceof Error ? err.message : String(err));
+}
+
 export function acpGraphAvailable(): boolean {
   try {
     if (!existsSync(acpGraphPath())) return false;
@@ -24,7 +34,7 @@ export function acpGraphAvailable(): boolean {
       const row = db.prepare('SELECT COUNT(*) AS c FROM checkpoints').get() as { c: number };
       return (row?.c ?? 0) > 0;
     } finally { db.close(); }
-  } catch { return false; }
+  } catch (err) { warn('acpGraphAvailable probe failed', err); return false; }
 }
 
 export interface AcpRecallHit { node: string; summary: string; score: number; }
@@ -46,19 +56,19 @@ export function acpGraphRecall(query: string, limit = 4): AcpRecallHit[] {
           const cps = db.prepare('SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1').all(r.id) as { summary: string }[];
           if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
         }
-      } catch { /* FTS */ }
+      } catch (err) { warn('ACP entity FTS query failed (cross-session hits lost)', err); }
       // 2) checkpoint 摘要命中
       try {
         const cps = db.prepare('SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?').all(matchQ, limit) as { session_id: string; seq_start: number; summary: string }[];
         for (const c of cps) out.push({ node: 'cp:' + c.session_id + ':' + c.seq_start, summary: c.summary, score: 0.8 });
-      } catch { /* FTS */ }
+      } catch (err) { warn('ACP checkpoint FTS query failed (cross-session hits lost)', err); }
       // 去重
       const seen = new Set<string>();
       const dedup: AcpRecallHit[] = [];
       for (const o of out) { if (!seen.has(o.node)) { seen.add(o.node); dedup.push(o); } }
       return dedup.slice(0, limit);
     } finally { db.close(); }
-  } catch { return []; }
+  } catch (err) { warn('ACP recall failed', err); return []; }
 }
 
 /** 热实体（ACP 图的高频节点，供首轮注入引导）。 */
@@ -69,5 +79,5 @@ export function acpGraphHotEntities(limit = 5): { node: string; count: number }[
     try {
       return db.prepare('SELECT title AS node, mention_count AS count FROM nodes ORDER BY mention_count DESC LIMIT ?').all(limit) as { node: string; count: number }[];
     } finally { db.close(); }
-  } catch { return []; }
+  } catch (err) { warn('ACP hot-entity query failed', err); return []; }
 }
