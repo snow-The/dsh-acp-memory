@@ -15,8 +15,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json --emitDeclarationOnly && esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@deepseek-ai/* --log-level=warning",
-    "test": "node --test test/capture.test.mjs",
-    "pretest": "esbuild src/dsh/capture.ts src/core/db.ts src/core/pipeline.ts src/core/crossagent.ts --bundle --platform=node --format=esm --outdir=.test-build --external:@deepseek-ai/* --log-level=warning",
+    "test": "node --test test/capture.test.mjs test/fts.test.mjs",
+    "pretest": "esbuild src/dsh/capture.ts src/core/db.ts src/core/pipeline.ts src/core/crossagent.ts src/core/acp.ts --bundle --platform=node --format=esm --outdir=.test-build --external:@deepseek-ai/* --log-level=warning",
     "fuzz": "node test/fuzz-capture.mjs --iters=400"
   },
   "files": [

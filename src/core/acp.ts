@@ -13,9 +13,9 @@ import { homedir } from 'node:os';
 
 /** FTS5 phrase builder: quotes every token so user text (paths like C:\\x, "*", ":", quotes)
  * can never be parsed as column filters or operators. Falls back to a harmless empty phrase. */
-function ftsPhrase(q: unknown): string {
+export function ftsPhrase(q: unknown): string {
   const toks = String(q ?? '').toLowerCase().replace(/["'^*:()\[\]{}]/g, ' ').split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
-  return toks.length ? toks.map((t) => '"' + t + '"').join(' OR ') : '""';
+  return toks.length ? toks.map((t) => '"' + t + '"*').join(' OR ') : '""';
 }
 
 export function acpGraphPath(): string {

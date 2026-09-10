@@ -406,3 +406,4 @@ function ageLabel(ms: number): string {
   if (diff < 30 * 86_400_000) return Math.floor(diff / 86_400_000) + 'd ago';
   return new Date(ms).toISOString().slice(0, 10);
 }
+
