@@ -25,6 +25,17 @@ before(async () => {
   cap = await import('../.test-build/dsh/capture.js');
 });
 
+test('sessionEvents() reads the harness Session shape, not a phantom .events', () => {
+  // the real Session: methods + a private log, and NO `events` property
+  const real = { ownEvents: () => [{ type: 'turn/end' }], log: [{ type: 'x' }] };
+  assert.equal(cap.sessionEvents(real).length, 1, 'ownEvents() wins');
+  assert.deepEqual(cap.sessionEvents({ log: [1, 2, 3] }), [1, 2, 3], 'log is the fallback');
+  assert.deepEqual(cap.sessionEvents({ snapshotEvents: () => [9] }), [9], 'snapshotEvents works too');
+  assert.deepEqual(cap.sessionEvents({}), [], 'no accessor means no events');
+  assert.deepEqual(cap.sessionEvents(null), [], 'null-safe');
+  assert.deepEqual(cap.sessionEvents({ ownEvents: () => { throw new Error('boom'); }, log: [7] }), [7], 'a throwing accessor falls through');
+});
+
 test('create() accepts an omitted optional field instead of throwing', () => {
   const db = dbmod.openDb();
   // `project` is optional and simply absent here - exactly what the capture path produces

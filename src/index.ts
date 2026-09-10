@@ -10,7 +10,7 @@ import { recallSearch, topMemories, projectOverview, hotKeywords } from './core/
 import { acpGraphAvailable, acpGraphRecall, acpGraphHotEntities } from './core/acp.js';
 import { extractKeywords } from './core/pipeline.js';
 import { buildFirstInjection, buildHitInjection, buildReinjection, isReinjectPending, markReinjectPending } from './dsh/inject.js';
-import { captureTurn, DEFAULT_CAPTURE_CONFIG } from './dsh/capture.js';
+import { captureTurn, DEFAULT_CAPTURE_CONFIG, sessionEvents } from './dsh/capture.js';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { homedir } from 'node:os';
 
@@ -310,7 +310,13 @@ export async function apply(ctx: any) {
         void (async () => {
           try {
             const db = getMem();
-            const written = await captureTurn(db, session?.events ?? [], captureConfig, null);
+            const events = sessionEvents(session);
+            // Canary: an empty event list used to mean "captured nothing" with no trace.
+            if (events.length === 0) {
+              console.warn('[acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)');
+              return;
+            }
+            const written = await captureTurn(db, events, captureConfig, null);
             if (written > 0) ctx.logger?.info('acp-memory: captured ' + written + ' memory entries');
           } catch (err) { console.warn('[acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
         })();

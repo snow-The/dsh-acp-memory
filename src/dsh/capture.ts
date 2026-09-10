@@ -22,6 +22,29 @@ export const DEFAULT_CAPTURE_CONFIG: CaptureConfig = {
   maxDistillPerTurn: 8,
 };
 
+/**
+ * Resolve a session's event list.
+ *
+ * The harness Session has NO `events` property: it exposes the log through methods
+ * (`ownEvents()`, `snapshotEvents()`) and a private `log` array. Reading
+ * `session.events` yields undefined, and `?? []` silently turned that into
+ * "nothing to capture" on every single turn - no exception, no log line, zero rows
+ * for days. Prefer the public accessors, fall back to the raw log.
+ */
+export function sessionEvents(session: unknown): readonly unknown[] {
+  const s = session as { ownEvents?: () => unknown; snapshotEvents?: () => unknown; log?: unknown; events?: unknown } | null | undefined;
+  if (s === null || s === undefined) return [];
+  for (const read of [() => s.ownEvents?.(), () => s.snapshotEvents?.()]) {
+    try {
+      const events = read();
+      if (Array.isArray(events)) return events;
+    } catch { /* try the next accessor */ }
+  }
+  if (Array.isArray(s.log)) return s.log;
+  if (Array.isArray(s.events)) return s.events;
+  return [];
+}
+
 /** 提取本 turn 的文本（从最近 turn/start 到末尾的 user/assistant 消息）。 */
 export function scanTurnText(events: readonly unknown[]): string {
   let startIdx = 0;
