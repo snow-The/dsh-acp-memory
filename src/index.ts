@@ -341,7 +341,7 @@ export async function apply(ctx: any) {
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: 'text', text: reinj.text }],
-            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot' },
+            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
           }));
           return { ...decision, messages: rewritten };
         }
@@ -360,7 +360,7 @@ export async function apply(ctx: any) {
             const rewritten = [...decision.messages];
             rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
               content: [{ type: 'text', text: inj.text }],
-              source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot' },
+              source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
             }));
             return { ...decision, messages: rewritten };
           }
@@ -377,7 +377,7 @@ export async function apply(ctx: any) {
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: 'text', text: hit.text }],
-            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot' },
+            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
           }));
           return { ...decision, messages: rewritten };
         }
