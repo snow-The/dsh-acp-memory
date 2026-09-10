@@ -46,35 +46,57 @@ export function sessionEvents(session: unknown): readonly unknown[] {
 }
 
 /** 提取本 turn 的文本（从最近 turn/start 到末尾的 user/assistant 消息）。 */
+/** Text blocks of a message payload, tolerating anything that is not the expected shape. */
+function textBlocks(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];                 // a non-array here used to throw "…filter is not a function"
+  const out: string[] = [];
+  for (const block of value) {
+    if (block === null || typeof block !== 'object') continue;
+    const b = block as { type?: unknown; text?: unknown };
+    if (b.type === 'text' && typeof b.text === 'string') out.push(b.text);
+  }
+  return out;
+}
+
+/**
+ * Extract this turn's text: from the last turn/start to the end of the log.
+ *
+ * TOTAL BY CONTRACT. The events come from the harness, but they are still untrusted
+ * shapes: a fuzz run with null entries, non-array message content and a throwing property
+ * getter made this throw on 139 of 400 cases. Production wraps the call, so the harness
+ * survived - but the turn's memory was silently lost, which is the failure mode this whole
+ * path exists to prevent. Every element is now inspected defensively and skipped if it is
+ * not what it claims to be.
+ */
 export function scanTurnText(events: readonly unknown[]): string {
+  if (!Array.isArray(events)) return '';
   let startIdx = 0;
   for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i] as { type?: string };
-    if (e?.type === 'turn/start') { startIdx = i; break; }
+    try {
+      const e = events[i] as { type?: unknown } | null | undefined;
+      if (e !== null && e !== undefined && e.type === 'turn/start') { startIdx = i; break; }
+    } catch { /* a hostile getter is not a turn marker */ }
   }
   const texts: string[] = [];
   for (let i = startIdx; i < events.length; i++) {
-    const e = events[i] as {
-      type?: string;
-      data?: {
-        source?: { kind?: string; plugin?: string };
-        content?: Array<{ type?: string; text?: string }>;
-        message?: { content?: Array<{ type?: string; text?: string }> };
-      };
-    };
-    if (e?.type === 'user/message') {
-      const src = e.data?.source as { kind?: string; plugin?: string } | undefined;
-      if (src?.kind === 'plugin') continue; // 跳过插件注入（不污染记忆）
-      const t = (e.data?.content ?? [])
-        .filter((b) => b.type === 'text' && typeof b.text === 'string')
-        .map((b) => b.text ?? '').join(' ');
-      if (t) texts.push('user: ' + t);
-    } else if (e?.type === 'assistant/message') {
-      const t = (e.data?.message?.content ?? [])
-        .filter((b) => b.type === 'text' && typeof b.text === 'string')
-        .map((b) => b.text ?? '').join(' ');
-      if (t) texts.push('assistant: ' + t);
-    }
+    try {
+      const e = events[i] as { type?: unknown; data?: unknown } | null | undefined;
+      if (e === null || e === undefined || typeof e !== 'object') continue;
+      const data = (e as { data?: unknown }).data as {
+        source?: { kind?: unknown; plugin?: unknown };
+        content?: unknown;
+        message?: { content?: unknown } | null;
+      } | null | undefined;
+      if (e.type === 'user/message') {
+        const src = data?.source;
+        if (src?.kind === 'plugin') continue; // 跳过插件注入（不污染记忆）
+        const t = textBlocks(data?.content).join(' ');
+        if (t) texts.push('user: ' + t);
+      } else if (e.type === 'assistant/message') {
+        const t = textBlocks(data?.message?.content).join(' ');
+        if (t) texts.push('assistant: ' + t);
+      }
+    } catch { /* one unreadable event must not cost the whole turn */ }
   }
   return texts.join('\n');
 }
