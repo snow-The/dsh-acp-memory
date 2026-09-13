@@ -83,7 +83,7 @@ test('create() still rejects nothing and stores explicit nulls', () => {
   db.close();
 });
 
-test('captureTurn writes an entry for real turn text', async () => {
+test('captureTurn records the turn as an episode and promotes nothing without an extractor', async () => {
   const db = dbmod.openDb();
   const events = [
     { type: 'turn/start', data: {} },
@@ -91,11 +91,23 @@ test('captureTurn writes an entry for real turn text', async () => {
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '已修复这个 bug，教训是不要吞异常。' }] } } },
     { type: 'turn/end', data: {} },
   ];
+  const facts = db.list('fact').length, lessons = db.list('lesson').length, eps = db.list('episode').length;
   const written = await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null);
-  assert.equal(written, 1, 'a turn with lesson-flavoured text must produce one entry');
-  const lessons = db.list('lesson');
-  assert.ok(lessons.some((r) => r.content.includes('教训')), 'the lesson is retrievable afterwards');
+  assert.equal(written, 0, 'the rule path has no extractor: it must promote nothing');
+  assert.equal(db.list('fact').length, facts, 'no fact may be invented');
+  assert.equal(db.list('lesson').length, lessons, 'no lesson may be invented');
+  assert.equal(db.list('episode').length, eps + 1, 'but the turn itself is recorded');
   db.close();
+});
+
+// The gate used to be missing entirely, so `promotableStatement` is where the line is drawn.
+test('promotableStatement de-labels one speaker and rejects transcripts, dumps and blanks', () => {
+  assert.equal(cap.promotableStatement('user: 教训是不要吞异常'), '教训是不要吞异常', 'one speaker label is a label');
+  assert.equal(cap.promotableStatement('教训是不要吞异常'), '教训是不要吞异常');
+  assert.equal(cap.promotableStatement('user: a\nassistant: b'), null, 'a back-and-forth is not a statement');
+  assert.equal(cap.promotableStatement('assistant: ok\nuser: thanks'), null);
+  assert.equal(cap.promotableStatement('偏'.repeat(300)), null, 'an oversized blob is not a statement');
+  assert.equal(cap.promotableStatement('   '), null);
 });
 
 test('captureTurn is idempotent for identical text (dedup holds)', async () => {
@@ -105,9 +117,53 @@ test('captureTurn is idempotent for identical text (dedup holds)', async () => {
     { type: 'user/message', data: { content: [{ type: 'text', text: 'dedup probe 唯一文本 ABC123' }] } },
     { type: 'turn/end', data: {} },
   ];
+  const before = db.list('episode').length;
   const first = await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null);
   const second = await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null);
-  assert.equal(first, 1);
-  assert.equal(second, 0, 'the same text must not be stored twice');
+  assert.equal(first, 0, 'no extractor, nothing promoted');
+  assert.equal(second, 0);
+  assert.equal(db.list('episode').length, before + 1, 'the same text must not be stored twice');
+  db.close();
+});
+
+// Production shape: 316 rows of "user: ... assistant: ..." dialogue sat in the lesson layer,
+// because capture promoted the whole turn verbatim. Two of them were the user complaining that
+// conversations were eating each other -- and were then injected back into other conversations.
+test('a raw dialogue turn becomes an episode and is NEVER promoted to fact/lesson', async () => {
+  const db = dbmod.openDb();
+  const events = [
+    { type: 'turn/start', data: {} },
+    { type: 'user/message', data: { content: [{ type: 'text', text: 'user: 教训是不要吞异常\nassistant: 对，我记住了' }] } },
+    { type: 'turn/end', data: {} },
+  ];
+  const factsBefore = db.list('fact').length;
+  const lessonsBefore = db.list('lesson').length;
+  const epsBefore = db.list('episode').length;
+  const written = await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null, { kind: 'session', id: 's-1' });
+  assert.equal(written, 0, 'a dialogue dump is not a statement, so nothing is promoted');
+  assert.equal(db.list('fact').length, factsBefore, 'nothing may reach the fact layer');
+  assert.equal(db.list('lesson').length, lessonsBefore, 'nothing may reach the lesson layer');
+  const eps = db.list('episode');
+  assert.equal(eps.length, epsBefore + 1, 'the raw turn is kept in the episode layer');
+  const last = eps[eps.length - 1];
+  assert.equal(last.scope_kind, 'session');
+  assert.equal(last.scope_id, 's-1');
+  assert.equal(last.source_session_id, 's-1', 'an episode records which conversation produced it');
+  db.close();
+});
+
+test('an episode is written even when the turn yields no promotion at all', async () => {
+  const db = dbmod.openDb();
+  const events = [
+    { type: 'turn/start', data: {} },
+    { type: 'user/message', data: { content: [{ type: 'text', text: 'plain chatter with nothing memorable in it 99887766' }] } },
+    { type: 'turn/end', data: {} },
+  ];
+  const before = db.list('episode').length;
+  await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null, { kind: 'session', id: 's-2' });
+  assert.equal(db.list('episode').length, before + 1, 'the record of what was said survives regardless');
+  const again = await cap.captureTurn(db, events, cap.DEFAULT_CAPTURE_CONFIG, null, { kind: 'session', id: 's-2' });
+  assert.equal(db.list('episode').length, before + 1, 'and it dedupes');
+  assert.equal(again, 0);
   db.close();
 });

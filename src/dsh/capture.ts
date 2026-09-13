@@ -4,7 +4,8 @@
  * 监听 session/event：turn/end 时扫描本轮文本，规则抽取（always）+ LLM 精炼（按需阈值），
  * 写入 memory.db。默认规则打底（零 LLM 成本），LLM 精炼通过阈值控制（可关）。
  */
-import type { MemoryDb } from '../core/db.js';
+import type { MemoryDb, Scope } from '../core/db.js';
+import { looksLikeDialogue, MAX_STATEMENT_CHARS } from '../core/recall.js';
 import { distill, extractKeywords, type LlmDistiller } from '../core/pipeline.js';
 
 export interface CaptureConfig {
@@ -105,29 +106,79 @@ export function scanTurnText(events: readonly unknown[]): string {
  * turn/end 捕获入口：扫描本轮文本 → 规则抽取 → 可选 LLM 精炼 → 写入 memory.db。
  * 返回写入条数（供日志）。
  */
+/**
+ * The promotion rule, as a pure function: what may leave the episode layer?
+ * scanTurnText() labels the speaker, so raw material arrives as a transcript ("user: ...").
+ * De-label ONE speaker, then require a statement: a back-and-forth ("\nassistant: ...") stays
+ * raw, an oversized blob stays raw, and an empty result promotes nothing.
+ * Also exported for tests -- this rule is the difference between "memory" and "the last thing
+ * that was said", and it used to have no gate at all.
+ */
+export function promotableStatement(raw: string): string | null {
+  const content = String(raw ?? '').replace(/^\s*(user|assistant|system)\s*:\s*/i, '').trim();
+  if (!content) return null;
+  if (looksLikeDialogue(content)) return null;
+  if (content.length > MAX_STATEMENT_CHARS) return null;
+  return content;
+}
+
 export async function captureTurn(
   db: MemoryDb,
   events: readonly unknown[],
   config: CaptureConfig,
   llm?: LlmDistiller | null,
+  /**
+   * Which domain this turn belongs to. Auto-capture MUST stamp one: an unstamped turn is
+   * indistinguishable from "true everywhere", which is how raw dialogue from one conversation
+   * ended up injected into every other one. No scope -> rows land in legacy (never auto-recalled,
+   * findable only by an explicit query).
+   */
+  scope?: Scope,
 ): Promise<number> {
   const text = scanTurnText(events);
   if (!text.trim()) return 0;
+  const sc = scope ?? { kind: 'legacy' as const, id: 'legacy' };
   try {
-    const entries = await distill({
-      text,
-      llm: config.llmEnabled ? (llm ?? null) : null,
-      llmMinChars: config.llmMinChars,
-    });
+    // 1. Raw layer FIRST. The episode is the record of what was said; it is never promoted to a
+    //    stronger claim and nothing injects it. Peers separate these too: Zep ingests episodes and
+    //    derives facts from them, A-MEM notes never become a fact tier, mem0 extracts at write time.
+    //    Auto-capture used to write the turn text straight into fact/lesson, which is how 500-char
+    //    dialogue dumps -- including the user complaining about memory bleed -- became searchable
+    //    "lessons" that were then injected back into other conversations.
+    const episodeExists = db.list('episode').find((r) => r.content === text);
+    const episode = episodeExists ?? db.create('episode', {
+      content: text, keywords: extractKeywords(text), scope_kind: sc.kind, scope_id: sc.id,
+      source_session_id: sc.kind === 'session' ? sc.id : null,
+    } as never);
+
+    // 2. Promotion is gated: only a STATEMENT may become a fact/lesson. Identity layers
+    //    (soul/user/rules) are never written here at all -- a regex guess about a whole turn is not
+    //    evidence about the user, and those layers reach every conversation on the machine.
+    // Auto-capture RECORDS; it does not assert. Without a real extractor the rule-based path
+    // returns the turn text itself -- a transcript -- and promoting that is exactly what put 316
+    // raw dialogue dumps in the lesson layer. Semantic layers are written by an extractor or
+    // explicitly, through memory_remember.
+    if (llm == null) return 0;
+    const entries = await distill({ text, llm, llmMinChars: config.llmMinChars });
     let written = 0;
     for (const e of entries.slice(0, config.maxDistillPerTurn)) {
+      const content = promotableStatement(String(e.content ?? ''));
+      if (content === null) continue;
+      const level = e.level === 'lesson' ? 'lesson' : 'fact';
       // 自动去重：同 level+content 已存在则跳过
-      const level = e.level ?? 'fact';
-      const exists = db.list(level).some((r) => r.content.trim() === (e.content ?? '').trim());
+      const exists = db.list(level).some((r) => r.content.trim() === content);
       if (exists) continue;
-      db.create(level, e as never);
+      // Provenance travels with the promotion: which conversation, and the exact episode it came
+      // from. Without this a bad memory cannot be traced back to what produced it.
+      db.create(level, {
+        ...(e as object), content, scope_kind: sc.kind, scope_id: sc.id,
+        source_session_id: sc.kind === 'session' ? sc.id : null,
+        source_episode_id: episode?.id ?? null,
+      } as never);
       written++;
     }
+    // The return value counts SEMANTIC entries only: callers log "captured N memory entries", and
+    // an episode is not a memory entry -- it is the raw material one could be derived from.
     return written;
   } catch (err) {
     // Never silent again: swallowing this made auto-capture write nothing for a week

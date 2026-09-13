@@ -67,16 +67,30 @@ export async function apply(ctx: any) {
       if (keywords.length === 0) keywords = extractKeywords(content);
 
       const db = getMem();
+      // A memory must name its domain at WRITE time -- mem0 raises without a scope key, and the
+      // absence of this rule is why 309 of 320 rows here were eligible for every conversation.
+      // Identity layers are global by nature; a named project is that project; anything else
+      // belongs to THIS session and nowhere else.
+      // The tool layer is not handed a session id (defineTool's typed surface takes args only, and
+      // guessing 'the running agent' would race when several conversations are open). So the rule is
+      // simpler and safer: name a domain, or the row is legacy.
+      const scope = (level === 'soul' || level === 'user' || level === 'rules')
+        ? { kind: 'global' as const, id: '' }
+        : project
+          ? { kind: 'project' as const, id: project }
+          : { kind: 'legacy' as const, id: 'legacy' };
       // auto-dedupe: same level+content (exact match) → merge keywords
       const existing = db.list(level).find((r) => r.content.trim() === content);
       let row: MemoryRow;
       if (existing) {
         const merged = Array.from(new Set([...existing.keywords, ...keywords]));
-        row = db.update(existing.id, { keywords: merged, project, subcategory, title, goal, importance })!;
+        row = db.update(existing.id, { keywords: merged, project, subcategory, title, goal, importance, scope_kind: scope.kind, scope_id: scope.id })!;
       } else {
         row = db.create(level, {
           content,
           project: project ?? (level === 'project' ? GLOBAL_PROJECT : undefined),
+          scope_kind: scope.kind,
+          scope_id: scope.id,
           subcategory,
           title,
           goal,
@@ -89,17 +103,39 @@ export async function apply(ctx: any) {
     },
   }));
 
+  // ---------------- memory_invalidate ----------------
+  ctx.tools.register(defineTool({
+    name: 'memory_invalidate',
+    description: 'Retire a memory row: mark it no longer true (invalidated_at) and optionally name the row that superseded it. Retired rows stop coming back from memory_search and can never be injected; pass includeInvalidated to memory_search to audit them. Use this instead of deleting when a fact was true once but is not any more.',
+    parameters: {
+      id: { type: 'string', required: true, description: 'memory id to retire' },
+      superseded_by: { type: 'string', description: 'id of the row that replaces it (optional)' },
+    },
+    output: textOut,
+    timeoutMs: 10000,
+    async execute(args: any) {
+      const id = String(args?.id ?? '').trim();
+      if (!id) throw new Error('id required');
+      const db = getMem();
+      const row = db.read(id);
+      if (!row) throw new Error('no memory with id ' + id);
+      const updated = db.update(id, { invalidated_at: Date.now(), superseded_by: String(args?.superseded_by ?? '').trim() || null } as never);
+      return 'retired [' + row.level + '] ' + id + (updated?.superseded_by ? ' (superseded by ' + updated.superseded_by + ')' : '') + '\n  ' + row.content.slice(0, 200);
+    },
+  }));
+
   // ---------------- memory_search ----------------
   ctx.tools.register(defineTool({
     name: 'memory_search',
     description: 'Search the seven-layer memory with keyword×BM25×recency-decay scoring. Supports level/project/status/days filters. Returns top hits with id, level, content, project, relative age, keywords.',
     parameters: {
       query: { type: 'string', required: true, description: 'search keywords (Chinese bigram + English tokens)' },
-      level: { type: 'string', description: `filter by layer: ${LEVELS_STR}` },
+      level: { type: 'string', description: `filter by layer: ${LEVELS_STR} | episode (episode = the raw record of a turn; searchable, never auto-injected, never promoted)` },
       project: { type: 'string', description: 'filter by project name (comma-separated = OR); 全局 always covers' },
       status: { type: 'string', description: 'filter by status: active|archived|stale' },
       days: { type: 'number', description: 'only entries created within N days' },
       limit: { type: 'number', description: 'max results (default 10)' },
+      includeInvalidated: { type: 'boolean', description: 'also return rows something explicitly retired (default false; for auditing)' },
     },
     output: textOut,
     timeoutMs: 10000,
@@ -107,15 +143,30 @@ export async function apply(ctx: any) {
       const query = String(args?.query ?? '').trim();
       if (!query) throw new Error('query required');
       const db = getMem();
+      // Explicit search is the ONE place allowed to span domains: the caller asked by name.
+      // Every hit prints its provenance so "global" (deliberate) is never confused with
+      // "legacy" (unknown origin) or with some other session's content.
       const hits = recallSearch(db.raw(), {
         query,
+        scope: 'any',
         limit: Number(args?.limit ?? 10) || 10,
         levels: args?.level ? [String(args.level) as Level] : null,
         project: args?.project ? String(args.project).split(',').map((s: string) => s.trim()) : null,
         days: args?.days ? Number(args.days) : null,
+        includeInvalidated: args?.includeInvalidated === true,
       });
       if (hits.length === 0) return 'no memory hit';
-      return hits.map((h) => `[${h.level}] ${h.id} (score ${h.score.toFixed(3)}, ${ageLabel(h.created_at)})\n  ${fmtRow(h)}`).join('\n');
+      const scopeTag = (h: any) => h.scope_kind === 'global' ? 'global' : (h.scope_kind ?? 'legacy') + ':' + (h.scope_id ?? 'legacy');
+      // Provenance on every hit: which conversation wrote it, which episode it came from, and
+      // whether something retired it. A date alone answers "when", never "where from" or "still true".
+      const provTag = (h: any) => {
+        const bits: string[] = [];
+        if (h.source_session_id) bits.push('src=' + String(h.source_session_id).slice(0, 8));
+        if (h.source_episode_id) bits.push('ep=' + String(h.source_episode_id).slice(0, 8));
+        if (h.invalidated_at) bits.push('RETIRED ' + ageLabel(h.invalidated_at) + (h.superseded_by ? ' by ' + String(h.superseded_by).slice(0, 8) : ''));
+        return bits.length ? ' ' + bits.join(' ') : '';
+      };
+      return hits.map((h) => `[${h.level}] ${h.id} @${scopeTag(h)}${provTag(h)} (score ${h.score.toFixed(3)}, ${ageLabel(h.created_at)})\n  ${fmtRow(h)}`).join('\n');
     },
   }));
 
@@ -220,7 +271,7 @@ export async function apply(ctx: any) {
       const query = String(args?.query ?? '').trim();
       if (!query) throw new Error('query required');
       const db = getMem();
-      const hits = recallSearch(db.raw(), { query, limit: Number(args?.limit ?? 5) || 5 });
+      const hits = recallSearch(db.raw(), { query, scope: 'any', limit: Number(args?.limit ?? 5) || 5 });
       if (hits.length === 0) return 'no similar memory';
       return hits.map((h) => fmtRow(h)).join('\n');
     },
@@ -281,7 +332,7 @@ export async function apply(ctx: any) {
       // 2. seven-layer local memory
       if (args?.includeLocal !== false) {
         const db = getMem();
-        const local = recallSearch(db.raw(), { query, limit: 4 });
+        const local = recallSearch(db.raw(), { query, scope: 'any', limit: 4 });
         if (local.length) {
           out.push('### local memory');
           for (const h of local) out.push(fmtRow(h));
@@ -316,7 +367,7 @@ export async function apply(ctx: any) {
               console.warn('[acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)');
               return;
             }
-            const written = await captureTurn(db, events, captureConfig, null);
+            const written = await captureTurn(db, events, captureConfig, null, { kind: 'session', id: sid });
             if (written > 0) ctx.logger?.info('acp-memory: captured ' + written + ' memory entries');
           } catch (err) { console.warn('[acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
         })();

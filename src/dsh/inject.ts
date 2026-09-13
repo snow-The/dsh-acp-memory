@@ -2,16 +2,22 @@
  * acp-memory — dsh/inject.ts（M4 注入机制）
  *
  * 借鉴 meow-memory 的注入模式，融合 ACP：
- * - 首轮注入：soul/user 全量 + 记忆导引（project/topic 标题）+ ACP 热实体 + 关键词命中 top-2
- * - 每轮 pre-step：动态命中（top-2）+ ACP graph recall 融合
+ * - 首轮注入：soul/user 全量 + 记忆索引（+ full 模式下的导引/热实体/命中）
+ * - 每轮 pre-step：动态命中（仅 full 模式）
  * - 压缩重注入：compaction/end 信号 → 下一用户消息轮重注入
  * - 已见去重：~/.dsh/memory/sessions/<id>.json 记录 injected/searched
+ *
+ * 隔离（2026-09-13）：注入原先没有任何"域"的概念——所有 project/topic 标题、跨会话热实体、
+ * 跨 agent 共识、每轮 top-2 命中，全部来自同一个全局库，于是 A 对话的内容被灌进 B 对话。
+ * 现在默认 scoped：只注入全局身份（soul/user/rules）+ 一行"有什么"的索引，其余一律按需查询。
+ * 注意：会话 header 里的 cwd 在本机恒为 C:\Users\snow（不是工作区），所以按路径分域做不到，
+ * 而 fact/lesson 的历史行 309/320 条 project 为空——无域可依时，答案就是"不注入，让人来问"。
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { MemoryDb, MemoryRow } from '../core/db.js';
-import { recallSearch, topMemories, hotKeywords } from '../core/recall.js';
+import { recallSearch, topMemories } from '../core/recall.js';
 import { acpGraphAvailable, acpGraphRecall, acpGraphHotEntities } from '../core/acp.js';
 import { crossAgentAvailable, crossAgentHot, crossAgentHits } from '../core/crossagent.js';
 
@@ -83,27 +89,81 @@ function unseen(rows: MemoryRow[], seenIds: string[]): MemoryRow[] {
   return rows.filter((r) => !set.has(r.id));
 }
 
+/**
+ * 自动注入的尺度。
+ * - scoped（默认）：只注入全局身份 + 一行索引。跨对话内容一律不推，改为按需查询。
+ * - full：2026-09-13 之前的行为（项目/话题清单 + 热实体 + 跨会话共识 + 每轮命中）。
+ * - off：完全不自动注入。
+ */
+export type InjectMode = 'scoped' | 'full' | 'off';
+
+export function injectMode(env: Record<string, string | undefined> = process.env): InjectMode {
+  const v = String(env.DSH_ACP_MEMORY_INJECT ?? '').trim().toLowerCase();
+  return v === 'full' || v === 'off' ? v : 'scoped';
+}
+
+/**
+ * 记忆索引：只说"库里有哪几个域、各多少条"，不说内容。
+ * 这是全域唯一该常驻的东西——工具与环境的大概索引；内容靠 memory_search / memory_project 取。
+ */
+export function memoryIndex(rows: MemoryRow[]): string {
+  const byProject = new Map<string, number>();
+  for (const r of rows) {
+    if (r.level !== 'fact' && r.level !== 'lesson' && r.level !== 'project') continue;
+    // Report the SCOPE, not the legacy free-text project column: they are different facts, and
+    // conflating them is what let 'no domain' read as 'every domain'.
+    const key = r.scope_kind === 'project' ? (String(r.scope_id ?? '').trim() || '(未标注)')
+      : r.scope_kind === 'global' ? '(全局)' : r.scope_kind === 'session' ? '(本会话)' : '(未标注)';
+    byProject.set(key, (byProject.get(key) ?? 0) + 1);
+  }
+  const parts = [...byProject.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => k + ' ' + n);
+  const topics = rows.filter((r) => r.level === 'topic').length;
+  const episodes = rows.filter((r) => r.level === 'episode').length;
+  const retired = rows.filter((r) => r.invalidated_at != null).length;
+  return '【记忆索引】' + parts.join(' / ') + '；话题 ' + topics + ' 条'
+    + (episodes ? '；原始 episode ' + episodes + ' 条（可搜、不可注入）' : '')
+    + (retired ? '；已失效 ' + retired + ' 条' : '')
+    + '。其它对话的内容不再自动注入，需要时用 memory_search / memory_project / acp_recall 查询。';
+}
+
 export interface Injection {
   text: string;
   injectedIds: string[];
 }
 
-/** 首轮注入：soul/user 全量 + rules importance≥2 + 导引 + ACP 热实体 + 命中 top-2。 */
-export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Promise<Injection | null> {
+export interface InjectOptions {
+  mode?: InjectMode;
+}
+
+/** 首轮注入：scoped = soul/user/rules + 索引；full = 原来的导引 + 热实体 + 共识 + 命中 top-2。 */
+export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2, opts: InjectOptions = {}): Promise<Injection | null> {
+  const mode = opts.mode ?? injectMode();
+  if (mode === 'off') return null;
   const rows = db.raw();
+  if (rows.length === 0) return null;
   const seen = readSeen(sid);
   const parts: string[] = ['===== 长期记忆 ====='];
 
-  // soul/user 全量 + rules importance≥2
+  // soul/user 全量 + rules importance≥2 —— 真正跨对话成立的东西
   const top = topMemories(rows);
   if (top.length) {
     parts.push('【关于你/用户】');
     for (const r of top) {
-      parts.push('- [' + r.level + '] ' + r.content);
+      // Date every injected identity line. An undated assertion is indistinguishable from a
+      // current one, which is how a statement from last week read as present tense.
+      const when = r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : '?';
+      parts.push('- [' + r.level + '] (' + when + ') ' + r.content);
     }
   }
 
-  // 记忆导引：project/topic 标题列表
+  if (mode === 'scoped') {
+    parts.push(memoryIndex(rows));
+    parts.push('【记忆导引】如需更多记忆，用 memory_search / memory_project / acp_recall 查询。');
+    writeSeen(sid, seen);
+    return { text: parts.join('\n'), injectedIds: seen.injected };
+  }
+
+  // ---- full：旧行为，仅作逃生门保留 ----
   const projects = rows.filter((r) => r.level === 'project');
   const topics = rows.filter((r) => r.level === 'topic');
   if (projects.length || topics.length) {
@@ -112,15 +172,14 @@ export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: 
     for (const r of topics.slice(0, 8)) parts.push('- topic: ' + (r.title ?? r.content));
   }
 
-  // ACP 热实体
   if (acpGraphAvailable()) {
     const hot = acpGraphHotEntities(5);
     if (hot.length) parts.push('【跨会话热实体】' + hot.map((h) => h.node).join(', '));
   }
 
-  // 关键词命中 top-2（首轮也命中，因为第一条用户消息已到）
   if (queryText) {
-    const hits = recallSearch(unseen(rows, seen.injected), { query: queryText, limit: hitTopK });
+    // Explicit session scope: 'any' is reserved for user-driven search, never for automatic injection.
+  const hits = recallSearch(unseen(rows, seen.injected), { query: queryText, limit: hitTopK, scope: { kind: 'session', id: sid } });
     if (hits.length) {
       parts.push('【可能相关记忆】');
       for (const h of hits) {
@@ -130,7 +189,6 @@ export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: 
     }
   }
 
-  // 跨上下文/跨 agent 共识（关系层派生数据，存在才用）
   if (await crossAgentAvailable()) {
     const hot = await crossAgentHot(5);
     if (hot.length) {
@@ -143,11 +201,17 @@ export async function buildFirstInjection(db: MemoryDb, sid: string, queryText: 
   return { text: parts.join('\n'), injectedIds: seen.injected };
 }
 
-/** 每轮命中注入：top-2 未见过命中 + ACP recall 融合。 */
-export async function buildHitInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2): Promise<Injection | null> {
+/**
+ * 每轮命中注入。scoped 模式下返回 null：
+ * 没有工作区信号时，"每轮从全局库捞 2 条"就是串味的来源，宁可一条都不推。
+ */
+export async function buildHitInjection(db: MemoryDb, sid: string, queryText: string, hitTopK = 2, opts: InjectOptions = {}): Promise<Injection | null> {
+  const mode = opts.mode ?? injectMode();
+  if (mode !== 'full') return null;
   const rows = db.raw();
   const seen = readSeen(sid);
-  const hits = recallSearch(unseen(rows, seen.injected), { query: queryText, limit: hitTopK });
+  // Explicit session scope: 'any' is reserved for user-driven search, never for automatic injection.
+  const hits = recallSearch(unseen(rows, seen.injected), { query: queryText, limit: hitTopK, scope: { kind: 'session', id: sid } });
   if (hits.length === 0 && !acpGraphAvailable()) return null;
 
   const parts: string[] = ['可能相关的记忆，仅供参考：'];
@@ -156,14 +220,12 @@ export async function buildHitInjection(db: MemoryDb, sid: string, queryText: st
     parts.push('- [' + h.level + '] ' + h.content);
     ids.push(h.id);
   }
-  // ACP 融合（跨检查点）
   if (acpGraphAvailable()) {
     const acpHits = acpGraphRecall(queryText, 2);
     for (const a of acpHits) {
       parts.push('- [acp] ' + a.summary.slice(0, 120));
     }
   }
-  // 跨上下文/跨 agent 共识命中：同一主题被多个会话/子代理独立提到时补充
   const cross = await crossAgentHits(queryText, 2);
   for (const c of cross) {
     const who = c.agent_kinds.length > 1 ? c.agent_kinds.join('+') : c.agent_kinds[0] ?? 'main';
@@ -173,8 +235,10 @@ export async function buildHitInjection(db: MemoryDb, sid: string, queryText: st
   return { text: parts.join('\n'), injectedIds: ids };
 }
 
-/** 压缩重注入：长期记忆快照 + 项目全景（不跑命中）。 */
-export function buildReinjection(db: MemoryDb, sid: string): Injection | null {
+/** 压缩重注入：scoped = 全局身份 + 索引；full = 原来的 top + 话题清单。 */
+export function buildReinjection(db: MemoryDb, sid: string, opts: InjectOptions = {}): Injection | null {
+  const mode = opts.mode ?? injectMode();
+  if (mode === 'off') return null;
   const rows = db.raw();
   const seen = readSeen(sid);
   clearReinjectPending(sid);
@@ -182,6 +246,11 @@ export function buildReinjection(db: MemoryDb, sid: string): Injection | null {
   if (top.length === 0) return null;
   const parts: string[] = ['===== 长期记忆（压缩后重注入）====='];
   for (const r of top.slice(0, 12)) parts.push('- [' + r.level + '] ' + r.content);
+  if (mode === 'scoped') {
+    const idx = memoryIndex(rows);
+    if (idx) parts.push(idx);
+    return { text: parts.join('\n'), injectedIds: [] };
+  }
   const topics = rows.filter((r) => r.level === 'topic').slice(0, 6);
   if (topics.length) {
     parts.push('【进行中话题】');

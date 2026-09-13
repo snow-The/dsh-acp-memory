@@ -12,10 +12,17 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
-export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules';
+export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules' | 'episode';
 export type Status = 'active' | 'archived' | 'stale';
 
-export const LEVELS: readonly Level[] = ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules'];
+export const LEVELS: readonly Level[] = ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules', 'episode'];
+
+/**
+ * The semantic layers: what the agent may assert and what may be injected. 'episode' is
+ * deliberately NOT in this set -- it is the raw record of what was said, never promoted to a
+ * stronger claim, and never injected.
+ */
+export const SEMANTIC_LEVELS: readonly Level[] = ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules'];
 
 /** project 子类（meow 拍板）：目标概述/项目结构/技术决策/用户原话/部署与数据/进行中。 */
 export const PROJECT_SUBCATEGORIES = ['overview', 'structure', 'decisions', 'quotes', 'ops', 'todo'] as const;
@@ -24,11 +31,60 @@ export type ProjectSubcategory = (typeof PROJECT_SUBCATEGORIES)[number];
 /** 全局标记（跨项目共享）。 */
 export const GLOBAL_PROJECT = '全局';
 
-export interface MemoryRow {
+/**
+ * 作用域。写的时候必填，读的时候必带——这是 mem0（search 缺 user_id/agent_id/run_id 直接抛异常）/
+ * Zep（user+thread 分区）/ LangGraph（namespace 元组）的共同做法，也是我们原先缺的那一层：
+ * 只有可空自由文本 project、召回不校验，于是"跨域"是默认情况（320 行里 309 行 project 为空）。
+ */
+export type ScopeKind = 'global' | 'session' | 'project' | 'legacy';
+
+export interface Scope {
+  kind: ScopeKind;
+  id: string;
+}
+
+/** 身份层（soul/user/rules）天然全局；其余必须带域。 */
+export const GLOBAL_SCOPE: Scope = { kind: 'global', id: '' };
+export const LEGACY_SCOPE: Scope = { kind: 'legacy', id: 'legacy' };
+
+/** 一行是否落在给定作用域内。legacy 永不自动命中——只能显式点名查。 */
+export function inScope(row: { scope_kind?: string | null; scope_id?: string | null }, scope: Scope): boolean {
+  const kind = row.scope_kind ?? 'legacy';
+  if (kind === 'global') return true;
+  if (scope.kind === 'legacy') return kind === 'legacy';
+  return kind === scope.kind && String(row.scope_id ?? '') === String(scope.id ?? '');
+}
+
+/**
+ * Provenance of a row. All four are optional so a caller that omits them falls back to the column
+ * default (node:sqlite refuses to bind undefined).
+ * - source_session_id: which conversation wrote it (null = manual write or unknown)
+ * - source_episode_id: the raw episode a promoted statement was derived from
+ * - invalidated_at:    when it stopped being true (null = live). NEVER inferred -- only an explicit
+ *                      retraction, or a supersede, sets it. Graphiti invalidates graph-wide with an
+ *                      LLM and its own issue #1728 shows 41% of 3,950 facts carried invalid_at with
+ *                      3 of 4 audited retirements being collateral damage; we start without that.
+ * - superseded_by:     id of the row that replaced it
+ */
+export interface Provenance {
+  source_session_id?: string | null;
+  source_episode_id?: string | null;
+  invalidated_at?: number | null;
+  superseded_by?: string | null;
+}
+
+/** A row still counts as true unless something explicitly retired it. */
+export function isLive(row: { invalidated_at?: number | null }): boolean {
+  return row.invalidated_at == null;
+}
+
+export interface MemoryRow extends Provenance {
   id: string;
   level: Level;
   content: string;
   project?: string | null;
+  scope_kind?: ScopeKind | null;
+  scope_id?: string | null;
   subcategory?: string | null;
   title?: string | null;
   goal?: string | null;
@@ -65,24 +121,26 @@ export interface MemoryDb {
 }
 
 const TABLE_DDL: Record<Level, string> = {
-  soul: `CREATE TABLE IF NOT EXISTS soul (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  user: `CREATE TABLE IF NOT EXISTS user (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  project: `CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, name TEXT NOT NULL, subcategory TEXT NOT NULL DEFAULT 'overview', content TEXT NOT NULL, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  fact: `CREATE TABLE IF NOT EXISTS fact (id TEXT PRIMARY KEY, content TEXT NOT NULL, project TEXT, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  lesson: `CREATE TABLE IF NOT EXISTS lesson (id TEXT PRIMARY KEY, content TEXT NOT NULL, project TEXT, corrected INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  topic: `CREATE TABLE IF NOT EXISTS topic (id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT, content TEXT, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
-  rules: `CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]')`,
+  soul: `CREATE TABLE IF NOT EXISTS soul (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  user: `CREATE TABLE IF NOT EXISTS user (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  project: `CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, name TEXT NOT NULL, subcategory TEXT NOT NULL DEFAULT 'overview', content TEXT NOT NULL, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  fact: `CREATE TABLE IF NOT EXISTS fact (id TEXT PRIMARY KEY, content TEXT NOT NULL, project TEXT, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  lesson: `CREATE TABLE IF NOT EXISTS lesson (id TEXT PRIMARY KEY, content TEXT NOT NULL, project TEXT, corrected INTEGER DEFAULT 0, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  topic: `CREATE TABLE IF NOT EXISTS topic (id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT, content TEXT, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  rules: `CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, content TEXT NOT NULL, importance INTEGER DEFAULT 1, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
+  episode: `CREATE TABLE IF NOT EXISTS episode (id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, keywords TEXT DEFAULT '[]', scope_kind TEXT, scope_id TEXT, source_session_id TEXT, source_episode_id TEXT, invalidated_at INTEGER, superseded_by TEXT)`,
 };
 
 /** 各层可写列（防止注入任意列）。 */
 const COLUMNS: Record<Level, string[]> = {
-  soul: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at'],
-  user: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at'],
-  project: ['name', 'subcategory', 'content', 'status', 'keywords', 'created_at', 'updated_at'],
-  fact: ['content', 'project', 'status', 'keywords', 'created_at', 'updated_at'],
-  lesson: ['content', 'project', 'corrected', 'status', 'keywords', 'created_at', 'updated_at'],
-  topic: ['title', 'goal', 'content', 'status', 'keywords', 'created_at', 'updated_at'],
-  rules: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at'],
+  soul: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  user: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  project: ['name', 'subcategory', 'content', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  fact: ['content', 'project', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  lesson: ['content', 'project', 'corrected', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  topic: ['title', 'goal', 'content', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  rules: ['content', 'importance', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
+  episode: ['content', 'status', 'keywords', 'created_at', 'updated_at', 'scope_kind', 'scope_id', 'source_session_id', 'source_episode_id', 'invalidated_at', 'superseded_by'],
 };
 
 export function openDb(path?: string): MemoryDb {
@@ -101,6 +159,15 @@ export function openDb(path?: string): MemoryDb {
       level,
       content: String(row.content ?? row.title ?? ''),
       project: row.project != null ? String(row.project) : null,
+      // A row without a scope is 'legacy', not 'global': unknown provenance must never be
+      // treated as universally true (that assumption is what put 309 unlabelled rows in every
+      // conversation on the machine).
+      scope_kind: (row.scope_kind != null ? String(row.scope_kind) : 'legacy') as ScopeKind,
+      scope_id: row.scope_id != null ? String(row.scope_id) : 'legacy',
+      source_session_id: row.source_session_id != null ? String(row.source_session_id) : null,
+      source_episode_id: row.source_episode_id != null ? String(row.source_episode_id) : null,
+      invalidated_at: row.invalidated_at != null ? Number(row.invalidated_at) : null,
+      superseded_by: row.superseded_by != null ? String(row.superseded_by) : null,
       subcategory: row.subcategory != null ? String(row.subcategory) : null,
       title: row.title != null ? String(row.title) : null,
       goal: row.goal != null ? String(row.goal) : null,
