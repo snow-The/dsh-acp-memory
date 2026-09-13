@@ -1,4 +1,4 @@
 node_modules/
-dist/
+# dist/ is COMMITTED on purpose: a git-hosted install must work without running a build
 *.log
 .test-build/
