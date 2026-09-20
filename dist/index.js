@@ -1130,7 +1130,7 @@ ${row.content}`;
       }
       if (!firstUserHandled.has(sid)) {
         firstUserHandled.add(sid);
-        const priorUser = (agent.session.events ?? []).filter((e) => e?.type === "user/message" && e?.data?.source?.kind === "user").length;
+        const priorUser = sessionEvents(agent.session).filter((e) => e?.type === "user/message" && e?.data?.source?.kind === "user").length;
         if (priorUser === 0) {
           const db2 = getMem();
           const firstText = String(lastUser?.content?.[0]?.text ?? "");

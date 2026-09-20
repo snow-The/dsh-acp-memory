@@ -408,7 +408,12 @@ export async function apply(ctx: any) {
       // 首条用户消息：首轮注入（长期记忆 + 导引 + ACP 热实体）
       if (!firstUserHandled.has(sid)) {
         firstUserHandled.add(sid);
-        const priorUser = (agent.session.events ?? []).filter((e: any) => e?.type === 'user/message' && e?.data?.source?.kind === 'user').length;
+        // sessionEvents, NOT `session.events`: the property does not exist on a harness session (see
+        // capture.ts, which this file already imports the helper from), so this count was ALWAYS 0 and
+        // the guard below always passed - a resumed session re-ran the first-turn injection after every
+        // restart. The once-per-session flag outside kept the damage small, which is exactly why it
+        // survived: the guard LOOKED like it was doing the job.
+        const priorUser = sessionEvents(agent.session).filter((e: any) => e?.type === 'user/message' && (e as any)?.data?.source?.kind === 'user').length;
         if (priorUser === 0) {
           const db = getMem();
           const firstText = String(lastUser?.content?.[0]?.text ?? '');
