@@ -264,90 +264,211 @@ function hotKeywords(rows, limit = 5) {
   return [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([k]) => k);
 }
 
-// src/core/acp.ts
+// src/core/acp-graph-contract.ts
 import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 import { existsSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { homedir as homedir2 } from "node:os";
+var ACP_GRAPH_CONTRACT_VERSION = 1;
+var ACP_GRAPH_V1_REQUIRED = {
+  checkpoints: ["session_id", "seq_start", "seq_end", "summary", "created_at"],
+  checkpoint_nodes: ["session_id", "seq_start", "node_id"],
+  nodes: ["id", "kind", "title", "mention_count"],
+  cp_fts: ["session_id", "seq_start", "summary"],
+  node_fts: ["id", "title", "kind"],
+  docs: ["id", "kind", "title", "body", "source", "indexed_at"],
+  doc_fts: ["id", "kind", "title", "body"]
+};
+function acpGraphPath() {
+  return join2(process.env.DSH_HOME ?? join2(homedir2(), ".dsh"), "graph", "graph.db");
+}
 function ftsPhrase(q) {
   const toks = String(q ?? "").toLowerCase().replace(/["'^*:()\[\]{}]/g, " ").split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
   return toks.length ? toks.map((t) => '"' + t + '"*').join(" OR ") : '""';
 }
-function acpGraphPath() {
-  return join2(process.env.DSH_HOME ?? join2(homedir2(), ".dsh"), "graph", "graph.db");
-}
-function warn(what, err) {
-  console.warn("[acp-memory] " + what + ":", err instanceof Error ? err.message : String(err));
-}
-function acpGraphAvailable() {
+function tableColumns(db, table) {
   try {
-    if (!existsSync(acpGraphPath())) return false;
-    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
-    try {
-      const row = db.prepare("SELECT COUNT(*) AS c FROM checkpoints").get();
-      return (row?.c ?? 0) > 0;
-    } finally {
-      db.close();
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    return rows.map((r) => r.name);
+  } catch {
+    return [];
+  }
+}
+function acpGraphStatus() {
+  const path = acpGraphPath();
+  const base = { path, contractVersion: ACP_GRAPH_CONTRACT_VERSION };
+  if (!existsSync(path)) {
+    return { ...base, ok: false, stampedVersion: 0, stamped: false, reason: "no-db", detail: `graph.db not found at ${path}` };
+  }
+  let db = null;
+  try {
+    db = new DatabaseSync2(path, { readOnly: true });
+    const stampedVersion = Number(
+      db.prepare("PRAGMA user_version").get()?.user_version ?? 0
+    );
+    if (stampedVersion > ACP_GRAPH_CONTRACT_VERSION) {
+      return {
+        ...base,
+        ok: false,
+        stampedVersion,
+        stamped: true,
+        reason: "schema-mismatch",
+        detail: `graph.db is stamped v${stampedVersion} but this reader implements v${ACP_GRAPH_CONTRACT_VERSION}; upgrade the reader`
+      };
     }
-  } catch (err) {
-    warn("acpGraphAvailable probe failed", err);
-    return false;
+    const missing = {};
+    for (const [table, cols] of Object.entries(ACP_GRAPH_V1_REQUIRED)) {
+      const have = tableColumns(db, table);
+      if (have.length === 0) {
+        missing[table] = [...cols];
+        continue;
+      }
+      const lack = cols.filter((c) => !have.includes(c));
+      if (lack.length) missing[table] = lack;
+    }
+    if (Object.keys(missing).length) {
+      return {
+        ...base,
+        ok: false,
+        stampedVersion,
+        stamped: stampedVersion > 0,
+        reason: "schema-mismatch",
+        detail: "graph.db shape does not satisfy contract v1",
+        missing
+      };
+    }
+    if (stampedVersion === 0) {
+      return {
+        ...base,
+        ok: true,
+        stampedVersion,
+        stamped: false,
+        reason: "no-contract",
+        detail: "graph.db has no user_version stamp (created before the contract); shape verified against v1"
+      };
+    }
+    return { ...base, ok: true, stampedVersion, stamped: true, reason: "ok" };
+  } catch (e) {
+    return {
+      ...base,
+      ok: false,
+      stampedVersion: 0,
+      stamped: false,
+      reason: "error",
+      detail: e instanceof Error ? e.message : String(e)
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+    }
+  }
+}
+function withAcpGraph(fn) {
+  const status = acpGraphStatus();
+  if (!status.ok) {
+    return {
+      ok: false,
+      reason: status.reason === "ok" ? "error" : status.reason,
+      detail: status.detail ?? status.reason,
+      status
+    };
+  }
+  let db = null;
+  try {
+    db = new DatabaseSync2(status.path, { readOnly: true });
+    return { ok: true, value: fn(db, status), status };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "error",
+      detail: e instanceof Error ? e.message : String(e),
+      status
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+    }
   }
 }
 function acpGraphRecall(query, limit = 4) {
-  try {
-    if (!acpGraphAvailable()) return [];
-    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
+  return withAcpGraph((db) => {
+    const q = String(query ?? "").toLowerCase().trim();
+    if (!q) return [];
+    const matchQ = ftsPhrase(q);
+    const out = [];
     try {
-      const q = String(query ?? "").toLowerCase().trim();
-      if (!q) return [];
-      const matchQ = ftsPhrase(q);
-      const out = [];
-      try {
-        const rows = db.prepare("SELECT id FROM node_fts WHERE node_fts MATCH ? LIMIT ?").all(matchQ, limit);
-        for (const r of rows) {
-          const cps = db.prepare("SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1").all(r.id);
-          if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
-        }
-      } catch (err) {
-        warn("ACP entity FTS query failed (cross-session hits lost)", err);
+      const rows = db.prepare("SELECT id FROM node_fts WHERE node_fts MATCH ? LIMIT ?").all(matchQ, limit);
+      for (const r of rows) {
+        const cps = db.prepare("SELECT c.summary FROM checkpoints c JOIN checkpoint_nodes cn ON cn.session_id=c.session_id AND cn.seq_start=c.seq_start WHERE cn.node_id=? ORDER BY c.created_at DESC LIMIT 1").all(r.id);
+        if (cps.length) out.push({ node: r.id, summary: cps[0].summary, score: 1 });
       }
-      try {
-        const cps = db.prepare("SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?").all(matchQ, limit);
-        for (const c of cps) out.push({ node: "cp:" + c.session_id + ":" + c.seq_start, summary: c.summary, score: 0.8 });
-      } catch (err) {
-        warn("ACP checkpoint FTS query failed (cross-session hits lost)", err);
-      }
-      const seen = /* @__PURE__ */ new Set();
-      const dedup = [];
-      for (const o of out) {
-        if (!seen.has(o.node)) {
-          seen.add(o.node);
-          dedup.push(o);
-        }
-      }
-      return dedup.slice(0, limit);
-    } finally {
-      db.close();
+    } catch {
     }
-  } catch (err) {
-    warn("ACP recall failed", err);
-    return [];
-  }
+    try {
+      const cps = db.prepare("SELECT session_id, seq_start, summary FROM cp_fts WHERE cp_fts MATCH ? LIMIT ?").all(matchQ, limit);
+      for (const c of cps) out.push({ node: "cp:" + c.session_id + ":" + c.seq_start, summary: c.summary, score: 0.8 });
+    } catch {
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const dedup = [];
+    for (const o of out) {
+      if (!seen.has(o.node)) {
+        seen.add(o.node);
+        dedup.push(o);
+      }
+    }
+    return dedup.slice(0, limit);
+  });
 }
 function acpGraphHotEntities(limit = 5) {
-  try {
-    if (!acpGraphAvailable()) return [];
-    const db = new DatabaseSync2(acpGraphPath(), { readOnly: true });
-    try {
-      return db.prepare("SELECT title AS node, mention_count AS count FROM nodes ORDER BY mention_count DESC LIMIT ?").all(limit);
-    } finally {
-      db.close();
-    }
-  } catch (err) {
-    warn("ACP hot-entity query failed", err);
+  return withAcpGraph(
+    (db) => db.prepare("SELECT title AS node, mention_count AS count FROM nodes ORDER BY mention_count DESC LIMIT ?").all(limit)
+  );
+}
+
+// src/core/acp.ts
+var lastProblem = null;
+function note(detail, status) {
+  lastProblem = { detail, status };
+  console.warn("[acp-memory] ACP graph read failed:", detail, `(reason=${status.reason})`);
+}
+function acpGraphStatusLine() {
+  const s = acpGraphStatus();
+  switch (s.reason) {
+    case "ok":
+      return `available (contract v${s.contractVersion}, db v${s.stampedVersion})`;
+    case "no-contract":
+      return `available (db has no version stamp; shape verified against contract v${s.contractVersion})`;
+    case "no-db":
+      return `not available \u2014 ${s.path} does not exist (is dsh-session-handoff installed?)`;
+    case "schema-mismatch":
+      return `NOT readable \u2014 ${s.detail}${s.missing ? " missing: " + JSON.stringify(s.missing) : ""}`;
+    default:
+      return `NOT readable \u2014 ${s.detail ?? "unknown error"}`;
+  }
+}
+function acpGraphAvailable() {
+  return acpGraphStatus().ok;
+}
+function acpGraphRecall2(query, limit = 4) {
+  const r = acpGraphRecall(query, limit);
+  if (!r.ok) {
+    note(r.detail, r.status);
     return [];
   }
+  lastProblem = null;
+  return r.value;
+}
+function acpGraphHotEntities2(limit = 5) {
+  const r = acpGraphHotEntities(limit);
+  if (!r.ok) {
+    note(r.detail, r.status);
+    return [];
+  }
+  lastProblem = null;
+  return r.value;
 }
 
 // src/core/pipeline.ts
@@ -414,7 +535,7 @@ function dshHome() {
 function crossAgentDbPath() {
   return process.env.DSH_NOTEMAP_DB ?? join3(dshHome(), "notemap", "graph.db");
 }
-function warn2(what, err) {
+function warn(what, err) {
   console.warn("[acp-memory] " + what + ":", err instanceof Error ? err.message : String(err));
 }
 var sqliteWarned = false;
@@ -426,7 +547,7 @@ async function openReadOnly() {
   } catch (err) {
     if (!sqliteWarned) {
       sqliteWarned = true;
-      warn2("cannot read the relation layer (cross-agent context disabled)", err);
+      warn("cannot read the relation layer (cross-agent context disabled)", err);
     }
     return null;
   }
@@ -454,7 +575,7 @@ async function crossAgentAvailable() {
     const row = db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE type = 'consensus'").get();
     return (row?.n ?? 0) > 0;
   } catch (err) {
-    warn2("consensus probe failed", err);
+    warn("consensus probe failed", err);
     return false;
   } finally {
     try {
@@ -470,7 +591,7 @@ async function crossAgentHot(limit = 5) {
     const rows = db.prepare("SELECT title, meta FROM nodes WHERE type = 'consensus' ORDER BY json_extract(meta, '$.score') DESC LIMIT ?").all(limit);
     return rows.map(rowToHit);
   } catch (err) {
-    warn2("consensus query failed", err);
+    warn("consensus query failed", err);
     return [];
   } finally {
     try {
@@ -491,7 +612,7 @@ async function crossAgentHits(query, limit = 2) {
     const rows = db.prepare(`SELECT title, meta FROM nodes WHERE type = 'consensus' AND (${where}) ORDER BY json_extract(meta, '$.score') DESC LIMIT ?`).all(...tokens.map((t) => "%" + t + "%"), limit);
     return rows.map(rowToHit);
   } catch (err) {
-    warn2("consensus match failed", err);
+    warn("consensus match failed", err);
     return [];
   } finally {
     try {
@@ -596,7 +717,7 @@ async function buildFirstInjection(db, sid, queryText, hitTopK = 2, opts = {}) {
     for (const r of topics.slice(0, 8)) parts.push("- topic: " + (r.title ?? r.content));
   }
   if (acpGraphAvailable()) {
-    const hot = acpGraphHotEntities(5);
+    const hot = acpGraphHotEntities2(5);
     if (hot.length) parts.push("\u3010\u8DE8\u4F1A\u8BDD\u70ED\u5B9E\u4F53\u3011" + hot.map((h) => h.node).join(", "));
   }
   if (queryText) {
@@ -633,7 +754,7 @@ async function buildHitInjection(db, sid, queryText, hitTopK = 2, opts = {}) {
     ids.push(h.id);
   }
   if (acpGraphAvailable()) {
-    const acpHits = acpGraphRecall(queryText, 2);
+    const acpHits = acpGraphRecall2(queryText, 2);
     for (const a of acpHits) {
       parts.push("- [acp] " + a.summary.slice(0, 120));
     }
@@ -1032,9 +1153,9 @@ ${row.content}`;
       }
       const hot = hotKeywords(rows, 5);
       if (hot.length) parts.push("hot keywords: " + hot.join(", "));
-      parts.push("acp graph available: " + acpGraphAvailable());
+      parts.push("acp graph: " + acpGraphStatusLine());
       if (acpGraphAvailable()) {
-        const ents = acpGraphHotEntities(5);
+        const ents = acpGraphHotEntities2(5);
         if (ents.length) parts.push("acp hot entities: " + ents.map((e) => e.node).join(", "));
       }
       return parts.join("\n");
@@ -1055,13 +1176,13 @@ ${row.content}`;
       if (!query) throw new Error("query required");
       const out = ["## ACP recall: " + query];
       if (acpGraphAvailable()) {
-        const hits = acpGraphRecall(query, Number(args?.limit ?? 4) || 4);
+        const hits = acpGraphRecall2(query, Number(args?.limit ?? 4) || 4);
         if (hits.length) {
           out.push("### graph (compacted sessions)");
           for (const h of hits) out.push(`- ${h.node}: ${h.summary.slice(0, 200)}`);
         }
       } else {
-        out.push("(acp graph not available \u2014 install dsh-session-handoff)");
+        out.push("(acp graph " + acpGraphStatusLine() + ")");
       }
       if (args?.includeLocal !== false) {
         const db = getMem();
@@ -1076,6 +1197,7 @@ ${row.content}`;
   }));
   const captureConfig = { ...DEFAULT_CAPTURE_CONFIG };
   const firstUserHandled = /* @__PURE__ */ new Set();
+  const MEMORY_SOURCE = { kind: "plugin:dsh-acp-memory", form: "snapshot", sections: [] };
   ctx.on("session/event", (session, event) => {
     try {
       const sid = String(session?.id ?? "");
@@ -1122,7 +1244,7 @@ ${row.content}`;
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: "text", text: reinj.text }],
-            source: { kind: "plugin", plugin: "dsh-acp-memory", form: "snapshot", sections: [] }
+            source: { ...MEMORY_SOURCE, sections: [] }
           }));
           return { ...decision, messages: rewritten };
         }
@@ -1139,7 +1261,7 @@ ${row.content}`;
             const rewritten = [...decision.messages];
             rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
               content: [{ type: "text", text: inj.text }],
-              source: { kind: "plugin", plugin: "dsh-acp-memory", form: "snapshot", sections: [] }
+              source: { ...MEMORY_SOURCE, sections: [] }
             }));
             return { ...decision, messages: rewritten };
           }
@@ -1154,7 +1276,7 @@ ${row.content}`;
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: "text", text: hit.text }],
-            source: { kind: "plugin", plugin: "dsh-acp-memory", form: "snapshot", sections: [] }
+            source: { ...MEMORY_SOURCE, sections: [] }
           }));
           return { ...decision, messages: rewritten };
         }

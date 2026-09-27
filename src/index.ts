@@ -7,7 +7,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { openDb, GLOBAL_PROJECT, PROJECT_SUBCATEGORIES, type Level, type MemoryRow } from './core/db.js';
 import { recallSearch, topMemories, projectOverview, hotKeywords } from './core/recall.js';
-import { acpGraphAvailable, acpGraphRecall, acpGraphHotEntities } from './core/acp.js';
+import { acpGraphAvailable, acpGraphRecall, acpGraphHotEntities, acpGraphStatusLine } from './core/acp.js';
 import { extractKeywords } from './core/pipeline.js';
 import { buildFirstInjection, buildHitInjection, buildReinjection, isReinjectPending, markReinjectPending } from './dsh/inject.js';
 import { captureTurn, DEFAULT_CAPTURE_CONFIG, sessionEvents } from './dsh/capture.js';
@@ -295,7 +295,7 @@ export async function apply(ctx: any) {
       }
       const hot = hotKeywords(rows, 5);
       if (hot.length) parts.push('hot keywords: ' + hot.join(', '));
-      parts.push('acp graph available: ' + acpGraphAvailable());
+      parts.push('acp graph: ' + acpGraphStatusLine());
       if (acpGraphAvailable()) {
         const ents = acpGraphHotEntities(5);
         if (ents.length) parts.push('acp hot entities: ' + ents.map((e) => e.node).join(', '));
@@ -327,7 +327,9 @@ export async function apply(ctx: any) {
           for (const h of hits) out.push(`- ${h.node}: ${h.summary.slice(0, 200)}`);
         }
       } else {
-        out.push('(acp graph not available — install dsh-session-handoff)');
+        // 如实报原因: 旧文案一律说"install dsh-session-handoff", 即使插件已装、
+        // 只是 schema 不匹配/库比消费方新, 也会把人引向错误方向。
+        out.push('(acp graph ' + acpGraphStatusLine() + ')');
       }
       // 2. seven-layer local memory
       if (args?.includeLocal !== false) {
@@ -346,6 +348,18 @@ export async function apply(ctx: any) {
   // ─────────── M3+M4: 记忆捕获 + 注入 hooks ───────────
   const captureConfig = { ...DEFAULT_CAPTURE_CONFIG };
   const firstUserHandled = new Set<string>();
+
+  /**
+   * Injected-memory message source, in the CURRENT (V4) producer-owned shape.
+   *
+   * The retired V3 spelling was `{ kind: 'plugin', plugin: 'dsh-acp-memory', ... }`.
+   * V4 admits only a producer-owned kind and hard-refuses `kind: 'plugin'`
+   * ("format v4 message requires a producer-owned source kind"), because the V3→V4
+   * migration moves the plugin name INTO the kind (`plugin:<name>`) and drops the
+   * `plugin` field. Injecting the retired shape aborts the whole run on any session
+   * still stored as V3, which is exactly the "本轮运行失败" seen in the web profile.
+   */
+  const MEMORY_SOURCE = { kind: 'plugin:dsh-acp-memory', form: 'snapshot', sections: [] } as const;
 
   // session/event：compaction/end → 置重注入待办；turn/end → 自动捕获
   ctx.on('session/event', (session: any, event: any) => {
@@ -398,7 +412,7 @@ export async function apply(ctx: any) {
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: 'text', text: reinj.text }],
-            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
+            source: { ...MEMORY_SOURCE, sections: [] },
           }));
           return { ...decision, messages: rewritten };
         }
@@ -422,7 +436,7 @@ export async function apply(ctx: any) {
             const rewritten = [...decision.messages];
             rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
               content: [{ type: 'text', text: inj.text }],
-              source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
+              source: { ...MEMORY_SOURCE, sections: [] },
             }));
             return { ...decision, messages: rewritten };
           }
@@ -439,7 +453,7 @@ export async function apply(ctx: any) {
           const rewritten = [...decision.messages];
           rewritten.splice(rewritten.indexOf(lastUser), 0, createUserMessage({
             content: [{ type: 'text', text: hit.text }],
-            source: { kind: 'plugin', plugin: 'dsh-acp-memory', form: 'snapshot', sections: [] },
+            source: { ...MEMORY_SOURCE, sections: [] },
           }));
           return { ...decision, messages: rewritten };
         }
