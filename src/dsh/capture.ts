@@ -183,7 +183,7 @@ export async function captureTurn(
   } catch (err) {
     // Never silent again: swallowing this made auto-capture write nothing for a week
     // while every health check looked green.
-    console.warn('[acp-memory] capture failed:', err instanceof Error ? err.message : String(err));
+    console.warn('[dsh-acp-memory] capture failed:', err instanceof Error ? err.message : String(err));
     return 0;
   }
 }

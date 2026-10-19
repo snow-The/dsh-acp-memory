@@ -378,15 +378,15 @@ export async function apply(ctx: any) {
             const events = sessionEvents(session);
             // Canary: an empty event list used to mean "captured nothing" with no trace.
             if (events.length === 0) {
-              console.warn('[acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)');
+              console.warn('[dsh-acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)');
               return;
             }
             const written = await captureTurn(db, events, captureConfig, null, { kind: 'session', id: sid });
             if (written > 0) ctx.logger?.info('acp-memory: captured ' + written + ' memory entries');
-          } catch (err) { console.warn('[acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
+          } catch (err) { console.warn('[dsh-acp-memory] capture hook failed:', err instanceof Error ? err.message : String(err)); }
         })();
       }
-    } catch (err) { console.warn('[acp-memory] session/event listener failed:', err instanceof Error ? err.message : String(err)); }
+    } catch (err) { console.warn('[dsh-acp-memory] session/event listener failed:', err instanceof Error ? err.message : String(err)); }
   });
 
   // pre-step：首轮注入 / 每轮命中 / 压缩重注入

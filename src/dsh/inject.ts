@@ -52,7 +52,7 @@ function writeSeen(sid: string, seen: SessionSeen): void {
   try {
     mkdirSync(dirname(sessionsFile(sid)), { recursive: true });
     writeFileSync(sessionsFile(sid), JSON.stringify(seen));
-  } catch (err) { console.warn('[acp-memory] writeSeen failed:', err instanceof Error ? err.message : String(err)); }
+  } catch (err) { console.warn('[dsh-acp-memory] writeSeen failed:', err instanceof Error ? err.message : String(err)); }
 }
 
 export function markInjected(sid: string, ids: string[]): void {

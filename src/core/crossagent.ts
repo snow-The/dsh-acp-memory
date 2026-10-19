@@ -36,7 +36,7 @@ export function crossAgentDbPath(): string {
 }
 
 function warn(what: string, err: unknown): void {
-  console.warn('[acp-memory] ' + what + ':', err instanceof Error ? err.message : String(err));
+  console.warn('[dsh-acp-memory] ' + what + ':', err instanceof Error ? err.message : String(err));
 }
 
 let sqliteWarned = false;

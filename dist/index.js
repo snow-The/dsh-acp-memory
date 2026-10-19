@@ -432,7 +432,7 @@ function acpGraphHotEntities(limit = 5) {
 var lastProblem = null;
 function note(detail, status) {
   lastProblem = { detail, status };
-  console.warn("[acp-memory] ACP graph read failed:", detail, `(reason=${status.reason})`);
+  console.warn("[dsh-acp-memory] ACP graph read failed:", detail, `(reason=${status.reason})`);
 }
 function acpGraphStatusLine() {
   const s = acpGraphStatus();
@@ -536,7 +536,7 @@ function crossAgentDbPath() {
   return process.env.DSH_NOTEMAP_DB ?? join3(dshHome(), "notemap", "graph.db");
 }
 function warn(what, err) {
-  console.warn("[acp-memory] " + what + ":", err instanceof Error ? err.message : String(err));
+  console.warn("[dsh-acp-memory] " + what + ":", err instanceof Error ? err.message : String(err));
 }
 var sqliteWarned = false;
 async function openReadOnly() {
@@ -646,7 +646,7 @@ function writeSeen(sid, seen) {
     mkdirSync2(dirname2(sessionsFile(sid)), { recursive: true });
     writeFileSync(sessionsFile(sid), JSON.stringify(seen));
   } catch (err) {
-    console.warn("[acp-memory] writeSeen failed:", err instanceof Error ? err.message : String(err));
+    console.warn("[dsh-acp-memory] writeSeen failed:", err instanceof Error ? err.message : String(err));
   }
 }
 function markInjected(sid, ids) {
@@ -894,7 +894,7 @@ async function captureTurn(db, events, config, llm, scope) {
     }
     return written;
   } catch (err) {
-    console.warn("[acp-memory] capture failed:", err instanceof Error ? err.message : String(err));
+    console.warn("[dsh-acp-memory] capture failed:", err instanceof Error ? err.message : String(err));
     return 0;
   }
 }
@@ -1212,18 +1212,18 @@ ${row.content}`;
             const db = getMem();
             const events = sessionEvents(session);
             if (events.length === 0) {
-              console.warn("[acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)");
+              console.warn("[dsh-acp-memory] turn/end with no readable events - capture skipped (session.events does not exist; use ownEvents()/log)");
               return;
             }
             const written = await captureTurn(db, events, captureConfig, null, { kind: "session", id: sid });
             if (written > 0) ctx.logger?.info("acp-memory: captured " + written + " memory entries");
           } catch (err) {
-            console.warn("[acp-memory] capture hook failed:", err instanceof Error ? err.message : String(err));
+            console.warn("[dsh-acp-memory] capture hook failed:", err instanceof Error ? err.message : String(err));
           }
         })();
       }
     } catch (err) {
-      console.warn("[acp-memory] session/event listener failed:", err instanceof Error ? err.message : String(err));
+      console.warn("[dsh-acp-memory] session/event listener failed:", err instanceof Error ? err.message : String(err));
     }
   });
   ctx.on("agent/pre-step", async ({ agent, messages, signal }, next) => {

@@ -40,7 +40,7 @@ let lastProblem: { detail: string; status: AcpGraphStatus } | null = null;
 function note(detail: string, status: AcpGraphStatus): void {
   lastProblem = { detail, status };
   // 只在错误路径上发一次日志：正常安装保持安静。
-  console.warn('[acp-memory] ACP graph read failed:', detail, `(reason=${status.reason})`);
+  console.warn('[dsh-acp-memory] ACP graph read failed:', detail, `(reason=${status.reason})`);
 }
 
 /** 诊断用：契约状态 + 最近一次失败原因。 */
